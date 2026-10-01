@@ -1,0 +1,256 @@
+from __future__ import annotations
+
+import io
+from pathlib import Path
+
+import pandas as pd
+import plotly.graph_objects as go
+import streamlit as st
+
+from engine import solve_measurement
+from io_utils import InputFormatError, parse_surface_cards, parse_well_data
+from storage import HistoryStore
+
+st.set_page_config(page_title="Análisis dinamométrico", page_icon="📈", layout="wide")
+
+APP_DIR = Path(__file__).resolve().parent
+DB_PATH = APP_DIR / "data" / "history.db"
+store = HistoryStore(DB_PATH)
+
+
+def card_figure(position, load, title: str):
+    fig = go.Figure()
+    fig.add_trace(
+        go.Scatter(
+            x=position,
+            y=load,
+            mode="lines",
+            name=title,
+            hovertemplate="Posición: %{x:.3f} in<br>Carga: %{y:.3f} kips<extra></extra>",
+        )
+    )
+    fig.update_layout(
+        title=title,
+        xaxis_title="Posición [in]",
+        yaxis_title="Carga [kips]",
+        margin=dict(l=20, r=20, t=50, b=20),
+        height=480,
+        showlegend=False,
+    )
+    return fig
+
+
+def import_files(cards_file, wells_file):
+    cards = parse_surface_cards(cards_file.getvalue(), cards_file.name)
+    configs = parse_well_data(wells_file.getvalue(), wells_file.name)
+
+    imported = 0
+    skipped = []
+    for (well_name, card_date), df in cards.items():
+        cfg = configs.get(well_name)
+        if cfg is None:
+            skipped.append(well_name)
+            continue
+
+        store.upsert_measurement(
+            well_name=well_name,
+            card_date=card_date,
+            surface_position=df["SurfacePosition_in"].to_numpy(float),
+            surface_load=df["SurfaceLoad_kips"].to_numpy(float),
+            config=cfg,
+            source_cards=cards_file.name,
+            source_config=wells_file.name,
+        )
+        imported += 1
+
+    return imported, sorted(set(skipped))
+
+
+def solve_and_store(measurement_id: int):
+    measurement = store.get_measurement(measurement_id)
+    if measurement is None:
+        raise ValueError("No se encontró la medición seleccionada.")
+    position, load, summary = solve_measurement(measurement)
+    store.save_result(measurement_id, position, load, summary)
+    return summary
+
+
+def selected_result_csv(measurement: dict) -> bytes:
+    data = {
+        "SurfacePosition_in": measurement["surface_position"],
+        "SurfaceLoad_kips": measurement["surface_load"],
+    }
+    if measurement["downhole_position"] is not None:
+        data["DownholePosition_in"] = measurement["downhole_position"]
+        data["DownholeLoad_kips"] = measurement["downhole_load"]
+    return pd.DataFrame(data).to_csv(index=False).encode("utf-8")
+
+
+st.title("Análisis dinamométrico")
+
+upload_col1, upload_col2 = st.columns(2)
+with upload_col1:
+    cards_file = st.file_uploader(
+        "Carga y posición",
+        type=["csv", "txt", "dat", "xlsx", "xls"],
+        help="Puede contener múltiples pozos y múltiples fechas por pozo.",
+    )
+with upload_col2:
+    wells_file = st.file_uploader(
+        "Datos de pozos",
+        type=["xlsx", "xls"],
+        help="Libro con las hojas Wells y RodString; Survey es opcional.",
+    )
+
+button_col1, button_col2, button_col3 = st.columns([1, 1, 2])
+with button_col1:
+    import_clicked = st.button(
+        "Importar / actualizar",
+        type="primary",
+        disabled=cards_file is None or wells_file is None,
+        use_container_width=True,
+    )
+with button_col2:
+    process_all_clicked = st.button(
+        "Calcular pendientes",
+        disabled=store.count() == 0,
+        use_container_width=True,
+    )
+
+if import_clicked:
+    try:
+        imported, skipped = import_files(cards_file, wells_file)
+        st.success(f"Se importaron o actualizaron {imported} mediciones.")
+        if skipped:
+            st.warning(
+                "No se importaron cartas sin configuración de pozo: "
+                + ", ".join(skipped)
+            )
+    except InputFormatError as exc:
+        st.error(str(exc))
+    except Exception as exc:
+        st.error(f"No se pudieron importar los archivos: {exc}")
+
+if process_all_clicked:
+    pending = store.pending_ids()
+    if not pending:
+        st.info("No hay mediciones pendientes de cálculo.")
+    else:
+        progress = st.progress(0)
+        status = st.empty()
+        errors = []
+        for i, measurement_id in enumerate(pending, start=1):
+            m = store.get_measurement(measurement_id)
+            status.write(f"Calculando {m['well_name']} — {m['card_date']}")
+            try:
+                solve_and_store(measurement_id)
+            except Exception as exc:
+                errors.append(f"{m['well_name']} / {m['card_date']}: {exc}")
+            progress.progress(i / len(pending))
+        status.empty()
+        progress.empty()
+        if errors:
+            st.warning(
+                f"Se completó el proceso con {len(errors)} error(es)."
+            )
+            with st.expander("Ver errores"):
+                for err in errors:
+                    st.write(err)
+        else:
+            st.success(f"Se calcularon {len(pending)} mediciones.")
+
+wells = store.list_wells()
+if not wells:
+    st.info("Sube los dos archivos para comenzar.")
+    st.stop()
+
+st.divider()
+
+selector_col1, selector_col2 = st.columns([1, 2])
+with selector_col1:
+    selected_well = st.selectbox("Pozo", wells)
+
+measurements = store.list_measurements(selected_well)
+measurement_labels = {
+    f"{m['card_date']}" + ("  ✓" if m["summary"] else ""): m["id"]
+    for m in measurements
+}
+with selector_col2:
+    selected_label = st.selectbox("Medición", list(measurement_labels.keys()))
+
+measurement_id = measurement_labels[selected_label]
+measurement = store.get_measurement(measurement_id)
+
+calc_col, download_col, backup_col, spacer = st.columns([1, 1, 1, 2])
+with calc_col:
+    if st.button("Calcular", type="primary", use_container_width=True):
+        try:
+            with st.spinner("Calculando carta de fondo..."):
+                solve_and_store(measurement_id)
+            st.rerun()
+        except Exception as exc:
+            st.error(f"No se pudo calcular la carta: {exc}")
+
+with download_col:
+    st.download_button(
+        "Descargar medición",
+        data=selected_result_csv(measurement),
+        file_name=f"{selected_well}_{measurement['card_date'].replace(':', '-')}.csv",
+        mime="text/csv",
+        use_container_width=True,
+    )
+with backup_col:
+    st.download_button(
+        "Descargar historial",
+        data=store.db_bytes(),
+        file_name="dynacard_history.db",
+        mime="application/octet-stream",
+        use_container_width=True,
+    )
+
+surface_col, downhole_col = st.columns(2)
+with surface_col:
+    st.plotly_chart(
+        card_figure(
+            measurement["surface_position"],
+            measurement["surface_load"],
+            "Carta de superficie",
+        ),
+        use_container_width=True,
+    )
+
+with downhole_col:
+    if measurement["downhole_position"] is not None:
+        st.plotly_chart(
+            card_figure(
+                measurement["downhole_position"],
+                measurement["downhole_load"],
+                "Carta de fondo",
+            ),
+            use_container_width=True,
+        )
+    else:
+        st.subheader("Carta de fondo")
+        st.info("Esta medición aún no ha sido calculada.")
+
+summary = measurement.get("summary")
+if summary:
+    st.subheader("Resultados")
+    m1, m2, m3, m4, m5, m6 = st.columns(6)
+    m1.metric("Carrera superficie", f"{summary['surface_stroke_in']:.2f} in")
+    m2.metric("Carrera fondo", f"{summary['downhole_stroke_in']:.2f} in")
+    m3.metric("Carga mín. superficie", f"{summary['surface_load_min_kips']:.2f} kips")
+    m4.metric("Carga máx. superficie", f"{summary['surface_load_max_kips']:.2f} kips")
+    m5.metric("Carga mín. fondo", f"{summary['downhole_load_min_kips']:.2f} kips")
+    m6.metric("Carga máx. fondo", f"{summary['downhole_load_max_kips']:.2f} kips")
+
+    with st.expander("Datos de cálculo"):
+        cfg = measurement["config"]["well"]
+        c1, c2, c3, c4 = st.columns(4)
+        c1.write(f"**SPM:** {summary['spm']:.4g}")
+        c2.write(f"**Bomba:** {summary['pump_diameter_in']:.3f} in")
+        c3.write(f"**Tubing ID:** {summary['tubing_id_in']:.3f} in")
+        c4.write(f"**Nodos:** {summary['n_nodes']}")
+        st.caption(
+            f"DigitalModel Everitt–Jennings · damping: {summary['damping_mode']}"
+        )
